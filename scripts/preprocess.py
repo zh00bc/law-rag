@@ -231,46 +231,60 @@ CONTEXT_PROMPT = """你是一个中国税法专家。请为以下法律条文生
 请直接输出上下文描述，不要加任何前缀或格式标记。"""
 
 
-def generate_contexts(chunks: list[dict], client: OpenAI, chat_model: str = 'openai/gpt-4.1-mini') -> list[str]:
-    """为每个 chunk 生成上下文描述"""
-    contexts = []
-    for i, chunk in enumerate(chunks):
-        meta = chunk['metadata']
-        # 从 text 中提取原始条文（去掉 【...】 前缀）
-        raw_text = chunk['text']
-        if raw_text.startswith('【'):
-            nl = raw_text.find('\n')
-            if nl != -1:
-                raw_text = raw_text[nl + 1:]
+def _generate_one_context(client: OpenAI, chat_model: str, chunk: dict) -> tuple[str, str]:
+    """为单个 chunk 生成上下文描述，返回 (chunk_id, context)"""
+    meta = chunk['metadata']
+    raw_text = chunk['text']
+    if raw_text.startswith('【'):
+        nl = raw_text.find('\n')
+        if nl != -1:
+            raw_text = raw_text[nl + 1:]
 
-        prompt = CONTEXT_PROMPT.format(
-            law_name=meta.get('law_name', ''),
-            chapter=meta.get('chapter', ''),
-            article_number=meta.get('article_number', ''),
-            article_text=raw_text[:1500],  # 截断超长附表
-        )
+    prompt = CONTEXT_PROMPT.format(
+        law_name=meta.get('law_name', ''),
+        chapter=meta.get('chapter', ''),
+        article_number=meta.get('article_number', ''),
+        article_text=raw_text[:1500],
+    )
 
-        ctx = ''
-        for attempt in range(3):
-            try:
-                resp = client.chat.completions.create(
-                    model=chat_model,
-                    messages=[{'role': 'user', 'content': prompt}],
-                    max_tokens=200,
-                    temperature=0.3,
-                )
-                ctx = resp.choices[0].message.content.strip()
-                break
-            except Exception as e:
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-                else:
-                    print(f'  Warning: context generation failed for {chunk["id"]}: {e}')
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=chat_model,
+                messages=[{'role': 'user', 'content': prompt}],
+                max_tokens=200,
+                temperature=0.3,
+            )
+            return (chunk['id'], resp.choices[0].message.content.strip())
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+            else:
+                print(f'  Warning: context generation failed for {chunk["id"]}: {e}')
+    return (chunk['id'], '')
 
-        contexts.append(ctx)
 
-        if (i + 1) % 20 == 0 or i + 1 == len(chunks):
-            print(f'  Generated context {i + 1}/{len(chunks)}')
+def generate_contexts(chunks: list[dict], client: OpenAI, chat_model: str = 'openai/gpt-4.1-mini', max_workers: int = 20) -> list[str]:
+    """并发为每个 chunk 生成上下文描述"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = {}
+    done_count = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_generate_one_context, client, chat_model, chunk): chunk['id']
+            for chunk in chunks
+        }
+        for future in as_completed(futures):
+            chunk_id, ctx = future.result()
+            results[chunk_id] = ctx
+            done_count += 1
+            if done_count % 50 == 0 or done_count == len(chunks):
+                print(f'  Generated context {done_count}/{len(chunks)}')
+
+    # 按原始顺序返回
+    contexts = [results.get(c['id'], '') for c in chunks]
 
     failed = sum(1 for c in contexts if not c)
     if failed:
