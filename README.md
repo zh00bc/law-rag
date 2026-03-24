@@ -228,6 +228,8 @@ LLM 生成的上下文描述是精度提升最大的单一因素。它让 embedd
 - **GTE-Qwen2**：C-MTEB 排名最高
 - 以上需要本地 GPU 或专门的 embedding API
 
+> **重要：预处理和查询必须使用同一个 embedding 模型。** 不同模型的向量空间完全不同，维度、结构、距离度量都不可比。如果更换 embedding 模型（如从 text-embedding-3-small 换到 BGE-M3），必须用新模型重新运行 `preprocess.py` 重新生成所有 chunks 的 embedding，不能只改查询端。混用不同模型的向量会导致检索结果完全错误。
+
 ### 6. 查询质量
 
 | 查询 | 检索效果 | 原因 |
