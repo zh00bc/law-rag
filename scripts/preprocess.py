@@ -1,11 +1,16 @@
 """
-本地预处理脚本：解析税法 markdown → 按条分块 → 调 OpenAI API embedding → 导出 chunks.json
+本地预处理脚本：解析税法 markdown → 按条分块 → 生成上下文描述 → embedding → 导出 chunks.json
+
+改进：
+- Contextual Embeddings（Anthropic 方法）：用 LLM 为每个 chunk 生成上下文描述
+- 上下文描述拼接在条文前面后再做 embedding，提升检索精度
 """
 
 import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -203,6 +208,65 @@ def chunk_document(filepath: Path) -> list[dict]:
     return chunks
 
 
+# ── Contextual Embeddings ──
+
+CONTEXT_PROMPT = """你是一个中国税法专家。请为以下法律条文生成一段简短的上下文描述（50-100字），用于辅助语义检索。
+
+要求：
+1. 说明该条文出自哪部法律、哪个章节
+2. 用通俗语言概括该条文的核心内容
+3. 列出 3-5 个关键检索词
+4. 不要复述条文原文
+
+法律名称：{law_name}
+章节：{chapter}
+条号：{article_number}
+
+条文内容：
+{article_text}
+
+请直接输出上下文描述，不要加任何前缀或格式标记。"""
+
+
+def generate_contexts(chunks: list[dict], client: OpenAI, chat_model: str = 'openai/gpt-4.1-mini') -> list[str]:
+    """为每个 chunk 生成上下文描述"""
+    contexts = []
+    for i, chunk in enumerate(chunks):
+        meta = chunk['metadata']
+        # 从 text 中提取原始条文（去掉 【...】 前缀）
+        raw_text = chunk['text']
+        if raw_text.startswith('【'):
+            nl = raw_text.find('\n')
+            if nl != -1:
+                raw_text = raw_text[nl + 1:]
+
+        prompt = CONTEXT_PROMPT.format(
+            law_name=meta.get('law_name', ''),
+            chapter=meta.get('chapter', ''),
+            article_number=meta.get('article_number', ''),
+            article_text=raw_text[:1500],  # 截断超长附表
+        )
+
+        try:
+            resp = client.chat.completions.create(
+                model=chat_model,
+                messages=[{'role': 'user', 'content': prompt}],
+                max_tokens=200,
+                temperature=0.3,
+            )
+            ctx = resp.choices[0].message.content.strip()
+        except Exception as e:
+            print(f'  Warning: context generation failed for {chunk["id"]}: {e}')
+            ctx = ''
+
+        contexts.append(ctx)
+
+        if (i + 1) % 20 == 0 or i + 1 == len(chunks):
+            print(f'  Generated context {i + 1}/{len(chunks)}')
+
+    return contexts
+
+
 # ── Embedding ──
 
 def generate_embeddings(chunks: list[dict], client: OpenAI, model: str = 'text-embedding-3-small', batch_size: int = 50) -> list[list[float]]:
@@ -256,7 +320,25 @@ def main():
     base_url = os.environ.get('OPENAI_BASE_URL', 'https://openrouter.ai/api/v1')
     client = OpenAI(api_key=api_key, base_url=base_url)
     print(f'Using API: {base_url}')
-    print('Generating embeddings...')
+
+    # 生成上下文描述（Contextual Embeddings）
+    chat_model = os.environ.get('CHAT_MODEL', 'openai/gpt-4.1-mini')
+    print(f'\nGenerating contextual descriptions using {chat_model}...')
+    contexts = generate_contexts(all_chunks, client, chat_model=chat_model)
+
+    # 将上下文拼接到 chunk text 前面
+    for chunk, ctx in zip(all_chunks, contexts):
+        if ctx:
+            # 保留原始条文在 raw_text 字段，方便 BM25 和展示
+            chunk['raw_text'] = chunk['text']
+            # 新的 text = 上下文描述 + 原始条文（用于 embedding）
+            chunk['text'] = ctx + '\n\n' + chunk['text']
+            chunk['context'] = ctx
+        else:
+            chunk['raw_text'] = chunk['text']
+            chunk['context'] = ''
+
+    print('\nGenerating embeddings...')
     embeddings = generate_embeddings(all_chunks, client)
 
     # 写入 JSON
