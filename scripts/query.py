@@ -183,12 +183,15 @@ def main():
         if not chunk:
             continue
         meta = chunk['metadata']
+        article_text = extract_display_text(chunk.get('raw_text', chunk['text']))
+        law_name = meta.get('law_name', '')
+        article_number = meta.get('article_number', '')
+        # 预格式化引用，LLM 可直接使用
+        citation = f'根据《{law_name}》{article_number}：'
         output.append({
-            'text': extract_display_text(chunk.get('raw_text', chunk['text'])),
-            'law_name': meta.get('law_name', ''),
-            'law_short_name': meta.get('law_short_name', ''),
+            'citation': citation,
+            'text': article_text,
             'chapter': meta.get('chapter', ''),
-            'article_number': meta.get('article_number', ''),
             'effective_date': meta.get('effective_date', ''),
             'score': round(rrf_score, 4),
         })
