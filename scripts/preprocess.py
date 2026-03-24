@@ -20,6 +20,7 @@ from openai import OpenAI
 
 ARTICLE_RE = re.compile(r'^(第[一二三四五六七八九十百零]+条)\s', re.MULTILINE)
 CHAPTER_RE = re.compile(r'^(第[一二三四五六七八九十]+章)\s+(.+)', re.MULTILINE)
+FULLWIDTH_SPACE_RE = re.compile(r'[\u3000\s]+')
 APPENDIX_RE = re.compile(r'^(附表[一二三四五六七八九十]*：|附：)\s*$', re.MULTILINE)
 TOC_MARKER = '目\u3000\u3000录'  # 目　　录
 
@@ -46,6 +47,8 @@ def cn_num_to_int(s: str) -> int:
         tens = CN_DIGITS.get(parts[0], 1) if parts[0] else 1
         ones = CN_DIGITS.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
         return tens * 10 + ones
+    if s.startswith('零'):
+        return cn_num_to_int(s[1:])
     return CN_DIGITS.get(s, 0)
 
 
@@ -135,7 +138,7 @@ def chunk_document(filepath: Path) -> list[dict]:
 
     # 构建 chapter 位置映射
     chapters = list(CHAPTER_RE.finditer(main_body))
-    chapter_positions = [(m.start(), f'{m.group(1)} {re.sub(r"[\u3000\\s]+", "", m.group(2).strip())}') for m in chapters]
+    chapter_positions = [(m.start(), m.group(1) + ' ' + FULLWIDTH_SPACE_RE.sub('', m.group(2).strip())) for m in chapters]
 
     def get_chapter(pos: int) -> str:
         ch = ''
@@ -247,22 +250,31 @@ def generate_contexts(chunks: list[dict], client: OpenAI, chat_model: str = 'ope
             article_text=raw_text[:1500],  # 截断超长附表
         )
 
-        try:
-            resp = client.chat.completions.create(
-                model=chat_model,
-                messages=[{'role': 'user', 'content': prompt}],
-                max_tokens=200,
-                temperature=0.3,
-            )
-            ctx = resp.choices[0].message.content.strip()
-        except Exception as e:
-            print(f'  Warning: context generation failed for {chunk["id"]}: {e}')
-            ctx = ''
+        ctx = ''
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(
+                    model=chat_model,
+                    messages=[{'role': 'user', 'content': prompt}],
+                    max_tokens=200,
+                    temperature=0.3,
+                )
+                ctx = resp.choices[0].message.content.strip()
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                else:
+                    print(f'  Warning: context generation failed for {chunk["id"]}: {e}')
 
         contexts.append(ctx)
 
         if (i + 1) % 20 == 0 or i + 1 == len(chunks):
             print(f'  Generated context {i + 1}/{len(chunks)}')
+
+    failed = sum(1 for c in contexts if not c)
+    if failed:
+        print(f'  Warning: {failed}/{len(chunks)} chunks have empty context')
 
     return contexts
 
@@ -285,7 +297,14 @@ def generate_embeddings(chunks: list[dict], client: OpenAI, model: str = 'text-e
 # ── Main ──
 
 def main():
-    load_dotenv(Path(__file__).resolve().parent.parent.parent / '.env')  # 加载 ../../.env
+    # 加载 .env（先找项目根目录，再找上级目录）
+    for env_path in [
+        Path(__file__).resolve().parent.parent / '.env',
+        Path(__file__).resolve().parent.parent.parent / '.env',
+    ]:
+        if env_path.exists():
+            load_dotenv(env_path)
+            break
 
     docs_dir = Path(__file__).resolve().parent.parent / 'docs'
     output_path = Path(__file__).resolve().parent.parent / 'data' / 'chunks.json'

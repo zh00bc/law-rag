@@ -187,7 +187,7 @@ def main():
         law_name = meta.get('law_name', '')
         article_number = meta.get('article_number', '')
         # 预格式化引用，LLM 可直接使用
-        citation = f'根据《{law_name}》{article_number}：'
+        citation = f'《{law_name}》{article_number}'
         output.append({
             'citation': citation,
             'text': article_text,
